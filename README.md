@@ -1,13 +1,24 @@
-# HariFun\_166\_Morphing\_Clock modified by SnowHead
+# HariFun\_166\_Morphing\_Clock modified by SnowHead and Jruys
 
 ----------
 
-# Attention! At the moment this fork only works for ESP8266 !
-## The search and inlucde of the suitable libraries for ESP32 is in progress 
-----------
+Forked from SnowHeads version which stopped working in 2026 because HTTP time request was sunset, back to NTP
+This fork only works for ESP8266
+Gemini helped with the fixes, it's not clean at all but at least it works again
 
+----------
 
 Read what this code primary was all about on [Instructable](https://www.instructables.com/id/Morphing-Digital-Clock/).
+
+**CHANGES BY JRUYS**
+
+- Changed back to NTP
+- Updated configuration webpage
+- Updated code to play nicely with latest ESP8266 board definitions and libraries (June 2026)
+
+Known issues
+- Changing clock color messes with time (it jumps forward/back a few seconds) - quick fix is to reset clock
+- Nigtmode does not work properly in 12hr mode (it evaluates based on 12hr clock, so night kicks in twice per day)
 
 **CHANGES BY SNOWHEAD**
 

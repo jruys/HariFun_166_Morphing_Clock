@@ -19,6 +19,12 @@ Read what this code primary was all about on [Instructable](https://www.instruct
 Known issues
 - Changing clock color messes with time (it jumps forward/back a few seconds) - quick fix is to reset clock
 - Nigtmode does not work properly in 12hr mode (it evaluates based on 12hr clock, so night kicks in twice per day)
+- DST logic is for Europe only - sorry for being selfish but main goal was to get my own clock running again
+
+What I really would like to do but isn't in this version
+- Use native time.h and do away with the odd manual NTP code
+- Add tickbox to suppress leading zero on hour display
+- Fix color change second drift bug
 
 **CHANGES BY SNOWHEAD**
 

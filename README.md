@@ -36,5 +36,6 @@ original: [![Morphing Clock](https://img.youtube.com/vi/i0M6F4wRxGc/0.jpg)](http
 
 modified: [![Morphing Clock](https://img.youtube.com/vi/GLg5dzmM7W4/0.jpg)](https://youtu.be/GLg5dzmM7W4)
 
-Because the ESP8266 is not able to dimm the brightness by PWM (trying this will produce an ugly flicker) the webinterface differs for ESP32 and ESP8266. The ESP8266 can set the display only to off in nightmode, can in normal state not reduce the brightness and must use all colors in full brightness.
+Because the ESP8266 is not able to dimm the brightness by PWM (trying this will produce an ugly flicker) the ESP8266 can set the display only to off in nightmode, can in normal state not reduce the brightness and must use all colors in full brightness.
+
 ESP8266:![MorphingClock](images/IF_8266.jpg)

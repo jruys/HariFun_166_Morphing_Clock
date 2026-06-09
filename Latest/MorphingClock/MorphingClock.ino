@@ -1,553 +1,285 @@
-// Morphing Clock improved by SnowHead, July 2019
-//
-// Thanks to:
-// Hari Wiguna for the primary solution
-// Dominic Buchstaller for PxMatrix
-// Tzapu for WifiManager
-// Stephen Denne aka Datacute for DoubleResetDetector
-// Brian Lough aka WitnessMeNow for tutorials on the matrix and WifiManager
+// =======================================================================================
+// Morphing Clock with Web Configuration Server - Persistent Memory Optimized Edition
+// Prevents dynamic heap fragmentation, handles double buffering, and syncs configs with Flash.
+// =======================================================================================
 
-#include "errno.h"
-#include "WTAClient.h"
-#define double_buffer
+#define PxMATRIX_DOUBLE_BUFFER // Enable showBuffer() in PxMatrix
 #include <PxMatrix.h>
-
-#ifdef ESP32
-
-#define P_LAT 22
-#define P_A 19
-#define P_B 23
-#define P_C 18
-#define P_D 5
-#define P_E 15
-#define P_OE 2
-hw_timer_t * timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-
-#endif
-
-#ifdef ESP8266
-
 #include <Ticker.h>
-Ticker display_ticker;
-#define P_LAT 16
-#define P_A 5
-#define P_B 4
-#define P_C 15
-#define P_D 12
-#define P_E 0
-#define P_OE 2
-#endif
-
-// Pins for LED MATRIX 1/16
-PxMATRIX display(64, 32, P_LAT, P_OE, P_A, P_B, P_C, P_D);
-
-// digit color (for ESP8266 only pure red, green or blue will work, dimmed colors will flicker)
-uint16_t COL_ACT = display.color565(0, 255, 0);  // green
-
-// Pins for LED MATRIX 1/32
-//PxMATRIX display(64, 32, P_LAT, P_OE, P_A, P_B, P_C, P_D, P_E);
-
-// the web-server-object
+#include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-ESP8266WebServer server(80);   //instantiate server at port 80 (http port)
 
-// structure holds the parameters to save nonvolatile memory
-#include <EEPROM.h>
-#define EEPROM_SIZE 128        // size of NV-memory
-typedef struct
-{
-  unsigned char h24;
-  unsigned char fade;
-  unsigned char r, g, b;
-  unsigned char brightness;
-  unsigned char timezone[32];
-  unsigned char nm_start;
-  unsigned char nm_end;
-  unsigned char nm_brightness;
-  unsigned char valid;
-} mclock_struct;
-mclock_struct mclock;
-mclock_struct *mclockp = &mclock;
-unsigned char *eptr;
-uint16_t brightness;
-bool nightmode;
-
-char outstr[512] = "";
-// string to hold the last displayed word-sequence
-char tstr1[128], tstr2[128] = "";
-
-#ifdef ESP8266
-#define refreshRate 0.020 // higher allows more time for WiFi, but makes the display dimmer. Originally 0.002
-#define persistenceMicroSeconds 200 // Higher = brighter.  Originally 70
-#else
-#define refreshRate 0.002 // higher allows more time for WiFi, but makes the display dimmer. Originally 0.002
-#define persistenceMicroSeconds 70 // Higher = brighter.  Originally 70
-#endif
-
-#ifdef ESP8266
-// ISR for display refresh
-void display_updater()
-{
-  //display.displayTestPattern(70);
-  display.display(persistenceMicroSeconds); // How many microseconds to enable the display
-}
-#endif
-
-//#ifdef ESP32
-//void IRAM_ATTR display_updater() {
-//  // Increment the counter and set the time of ISR
-//  portENTER_CRITICAL_ISR(&timerMux);
-//  //display.display(70);
-//  display.displayTestPattern(70);
-//  portEXIT_CRITICAL_ISR(&timerMux);
-//}
-//#endif
-
-//=== SEGMENTS ===
 #include "Digit.h"
-enum
-{
-  DIG_S0, DIG_S1, DIG_M0, DIG_M1, DIG_H0, DIG_H1, NUM_DIGITS
-};
+#include "NTPClient.h"
+#include "TinyFont.h"
 
-Digit digit0(&display, 0, 63 - 1 - 9 * 1, 8, COL_ACT);
-Digit digit1(&display, 0, 63 - 1 - 9 * 2, 8, COL_ACT);
-Digit digit2(&display, 0, 63 - 4 - 9 * 3, 8, COL_ACT);
-Digit digit3(&display, 0, 63 - 4 - 9 * 4, 8, COL_ACT);
-Digit digit4(&display, 0, 63 - 7 - 9 * 5, 8, COL_ACT);
-Digit digit5(&display, 0, 63 - 7 - 9 * 6, 8, COL_ACT);
-Digit *Digits[NUM_DIGITS] =
-{ &digit0, &digit1, &digit2, &digit3, &digit4, &digit5 };
+// --- Direct Linkage to Unified Persistent Configuration Engine Variables inside NTPClient.cpp ---
+extern char timezone[5];
+extern bool military;
+extern int displayColorMode;
+extern int morphFade;
+extern int nightModeStart;
+extern int nightModeEnd;
+extern bool saveConfig();
 
-//=== CLOCK ===
-#include "WTAClient.h"
-WTAClient wtaClient;
-volatile unsigned long prevEpoch;
-byte prevhh;
-byte prevmm;
-byte prevss;
+// --- Hardware Matrix Wiring Pins (ESP8266 Configuration) ---
+#define P_LAT 16
+#define P_A   5
+#define P_B   4
+#define P_C   15
+#define P_D   12
+#define P_E   0
+#define P_OE  2
 
-void update_color(void)
-{
-  COL_ACT = display.color565((brightness * mclockp->r) / 40, (brightness * mclockp->g) / 40, (brightness * mclockp->b) / 40);
-  for (int i = 0; i < NUM_DIGITS; i++)
-    Digits[i]->SetColor(COL_ACT);
-  display.fillScreen(display.color565(0, 0, 0));
-  Digits[DIG_S1]->DrawColon(COL_ACT);
-  Digits[DIG_M1]->DrawColon(COL_ACT);
-  prevEpoch = 0;
+PxMATRIX display(64, 32, P_LAT, P_OE, P_A, P_B, P_C, P_D, P_E);
+Ticker display_ticker;
+
+// Interrupt Service Routine for Matrix Redraws
+void display_updater() {
+  display.display(70);
 }
 
-// dynamic generation of the web-servers response
-void page_out(void)
-{
-  if (strlen(outstr))
-  {
-    server.sendContent(outstr);
-    *outstr = 0;
-  }
-  else
-  {
-    server.sendContent("<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\"><html><head><meta http-equiv=\"content-type\"content=\"text/html; charset=ISO-8859-1\"><title>MorphClock_Server</title></head>\r\n<body><h1 style=\"text-align: center; width: 504px;\" align=\"left\"><span style=\"color: rgb(0, 0, 153); font-weight: bold;\">MorphingClock-Server</span></h1><h3 style=\"text-align: center; width: 504px;\" align=\"left\"><span style=\"color: rgb(0, 0, 0); font-weight: bold;\">");
-    server.sendContent(tstr2);
-    server.sendContent("</span></h3><form method=\"get\"><table border=\"0\" cellpadding=\"0\" cellspacing=\"0\" height=\"144\" width=\"487\"><tbody><tr><td width=\"120\"><b><big> Hour mode <td width=\"50\"></td><td><input name=\"HMOD24\" type=\"checkbox\" mode=\"submit\"");
-    if (mclockp->h24)
-      server.sendContent(" checked");
-    server.sendContent("> 24h </td></tr>");
-    server.sendContent("<tr><td><b><big>Timezone</big></b></td><td></td><td><input maxlength=\"31\" size=\"31\" name=\"TIMEZONE\" value=\"");
-    server.sendContent((char*)&mclockp->timezone);
-    server.sendContent("\"></td></tr><tr><td> </td><td> </td><td>See <a href=\"http://www.worldtimeapi.org/api/timezones.txt\">List</a> (\"ip\" means \"automatic\")</td></tr><tr><td> <br></td></tr>");
+#define NUM_DIGITS 6
+Digit* Digits[NUM_DIGITS];
 
-#ifdef ESP32
-    server.sendContent("<tr><td><b><big>Brightness</big></b></td><td></td><td><input maxlength=\"3\" size=\"3\" name=\"BRIGHT\" value=\"");
-    server.sendContent(String(mclockp->brightness));
-    server.sendContent("\"> %</td></tr>");
-#endif
-    server.sendContent("<tr><td><b><big>Nightmode</font></big></b><td></td>");
-#ifdef ESP32
-    server.sendContent("<td>Brightness<br><input maxlength=\"3\" size=\"3\" name=\"NMBRIGHT\" value=\"");
-    server.sendContent(String(mclockp->nm_brightness));
-    server.sendContent("\"> %</td>");
-#endif
-    server.sendContent("<td>Start<br><input maxlength=\"3\" size=\"3\" name=\"NMSTART\" value=\"");
-    server.sendContent(((mclockp->nm_start > 9) ? "" : "0") + String(mclockp->nm_start));
-    server.sendContent("\"> h</td><td>End<br><input maxlength=\"3\" size=\"3\" name=\"NMEND\" value=\"");
-    server.sendContent(((mclockp->nm_end > 9) ? "" : "0") + String(mclockp->nm_end));
-    server.sendContent("\"> h</td></tr><tr><td> <br></tr>");
-    server.sendContent("</td></tr><tr><td><b><big>Fading</font></big></b></td><td></td><td><input maxlength=\"3\" size=\"3\" name=\"FADE\" value=\"");
-    server.sendContent(String(mclockp->fade));
-    server.sendContent("\"> ms</td></tr>");
-#ifdef ESP32
-    server.sendContent("<tr><td><b><big><font color=\"#cc0000\">Red</font></big></b></td><td></td><td><input maxlength=\"3\" size=\"3\" name=\"RED\" value=\"");
-    server.sendContent(String(mclockp->r));
-    server.sendContent("\"> %</td></tr><tr><td><b><big><font color=\"#006600\">Green</font></big></b></td><td></td><td><input maxlength=\"3\" size=\"3\" name=\"GREEN\" value=\"");
-    server.sendContent(String(mclockp->g));
-    server.sendContent("\"> %</td></tr><tr><td><b><big><font color=\"#000099\">Blue</font></big></b></td><td></td><td><input maxlength=\"3\" size=\"3\" name=\"BLUE\" value=\"");
-    server.sendContent(String(mclockp->b));
-    server.sendContent("\"> %</td></tr>");
-#else
-    server.sendContent("<tr><td width=\"120\"><b><big><font color=\"#cc0000\">Red</font></big></b></td><td></td><td><input name=\"RED\" type=\"checkbox\" mode=\"submit\"");
-    if (mclockp->r)
-      server.sendContent(" checked");
-    server.sendContent("></td></tr>");
-    server.sendContent("<tr><td width=\"120\"><b><big><font color=\"#006600\">Green</font></big></b></td><td></td><td><input name=\"GREEN\" type=\"checkbox\" mode=\"submit\"");
-    if (mclockp->g)
-      server.sendContent(" checked");
-    server.sendContent("></td></tr>");
-    server.sendContent("<tr><td width=\"120\"><b><big><font color=\"#000099\">Blue</font></big></b></td><td></td><td><input name=\"BLUE\" type=\"checkbox\" mode=\"submit\"");
-    if (mclockp->b)
-      server.sendContent(" checked");
-    server.sendContent("></td></tr>");
-#endif
-    server.sendContent("</tbody></table><br><table border=\"0\" cellpadding=\"0\" cellspacing=\"0\" height=\"30\" width=\"99\"><tbody><tr><td><input name=\"SEND\" value=\" Send \" type=\"submit\"></td></tr></tbody></table></form><table border=\"0\" cellpadding=\"0\" cellspacing=\"0\" height=\"30\" width=\"99\"><tbody><tr><td><form method=\"get\"><input name=\"SAVE\" value=\" Save \" type=\"submit\"></form></td></tr></tbody></table></body></html>\r\n");
+ESP8266WebServer server(80);
+NTPClient ntpClient;
+
+unsigned long prevEpoch = 0;
+byte prevhh = 99, prevmm = 99, prevss = 99;
+
+// Helper to convert selection mode to RGB565 color format
+uint16_t getDisplayColor(int mode) {
+  switch (mode) {
+    case 0: return display.color565(255, 0, 0);     // Red
+    case 1: return display.color565(0, 255, 0);     // Green
+    case 2: return display.color565(0, 0, 255);     // Blue
+    case 3: return display.color565(255, 255, 255); // White
+    case 4: return display.color565(255, 255, 0);   // Yellow
+    case 5: return display.color565(0, 255, 255);   // Cyan
+    case 6: return display.color565(255, 0, 255);   // Purple
+    default: return display.color565(0, 0, 255);    // Default to Blue
   }
 }
 
-void setup()
-{
+// Helper to instantly push color/time updates across both canvas buffers
+void updateDisplayColors() {
+  uint16_t newColor = getDisplayColor(displayColorMode);
+  for (int i = 0; i < NUM_DIGITS; i++) {
+    Digits[i]->SetColor(newColor);
+  }
+  
+  if (prevEpoch != 0) {
+    int hh = ntpClient.GetHours();
+    int mm = ntpClient.GetMinutes();
+    int ss = ntpClient.GetSeconds();
+    
+    // Force immediate draw across front buffer channel
+    display.clearDisplay();
+    Digits[0]->Draw(ss % 10); Digits[1]->Draw(ss / 10);
+    Digits[2]->Draw(mm % 10); Digits[3]->Draw(mm / 10);
+    Digits[4]->Draw(hh % 10); Digits[5]->Draw(hh / 10);
+    Digits[1]->DrawColon(newColor); Digits[3]->DrawColon(newColor);
+    display.showBuffer();
+    
+    // Force immediate draw across back buffer channel
+    display.clearDisplay();
+    Digits[0]->Draw(ss % 10); Digits[1]->Draw(ss / 10);
+    Digits[2]->Draw(mm % 10); Digits[3]->Draw(mm / 10);
+    Digits[4]->Draw(hh % 10); Digits[5]->Draw(hh / 10);
+    Digits[1]->DrawColon(newColor); Digits[3]->DrawColon(newColor);
+    display.showBuffer();
+  }
+}
+
+// --- Web Server Response Engine ---
+void page_out(void) {
+  server.sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  server.sendHeader(F("Pragma"), F("no-cache"));
+  server.sendHeader(F("Expires"), F("0"));
+  
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, F("text/html"), F(""));
+
+  server.sendContent(F("<!DOCTYPE html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Clock</title>"));
+  server.sendContent(F("<style>body{font-family:sans-serif;background:#121212;color:#e0e0e0;padding:20px;max-width:400px;margin:0 auto}h2{color:#3498db}label{display:block;margin:15px 0 5px;font-weight:bold}input[type=number],select{background:#1e1e1e;border:1px solid #333;color:#fff;padding:8px;border-radius:4px;width:100%;box-sizing:border-box}input[type=checkbox]{transform:scale(1.3);margin-right:10px;vertical-align:middle}.btn{padding:10px 20px;border:0;border-radius:4px;color:#fff;font-weight:bold;cursor:pointer;margin-top:15px}.send{background:#3498db}</style>"));
+  server.sendContent(F("<h2>MorphingClock Configuration</h2><form method=get>"));
+
+  server.sendContent(F("<label><input type=checkbox name=HMOD24"));
+  if (military) server.sendContent(F(" checked"));
+  server.sendContent(F("> 24h Mode</label>"));
+  
+  char buf[64];
+
+  server.sendContent(F("<label>GMT Timezone Offset (e.g. -5, 0, 1):</label>"));
+  snprintf(buf, sizeof(buf), "<input type=number name=TZ min=-12 max=14 value=\"%s\">", timezone);
+  server.sendContent(buf);
+
+  server.sendContent(F("<label>Night Mode Start Hour (0-23):</label>"));
+  snprintf(buf, sizeof(buf), "<input type=number name=NMSTART min=0 max=23 value=\"%02d\">", nightModeStart);
+  server.sendContent(buf);
+
+  server.sendContent(F("<label>Night Mode End Hour (0-23):</label>"));
+  snprintf(buf, sizeof(buf), "<input type=number name=NMEND min=0 max=23 value=\"%02d\">", nightModeEnd);
+  server.sendContent(buf);
+
+  server.sendContent(F("<label>Morph Speed / Delay (ms):</label>"));
+  snprintf(buf, sizeof(buf), "<input type=number name=FADE min=5 max=500 value=\"%d\">", morphFade);
+  server.sendContent(buf);
+
+  server.sendContent(F("<label>Display Color:</label>"));
+  server.sendContent(F("<select name=COLOR>"));
+  
+  server.sendContent(F("<option value=\"red\"")); if (displayColorMode == 0) server.sendContent(F(" selected")); server.sendContent(F(">Red</option>"));
+  server.sendContent(F("<option value=\"green\"")); if (displayColorMode == 1) server.sendContent(F(" selected")); server.sendContent(F(">Green</option>"));
+  server.sendContent(F("<option value=\"blue\"")); if (displayColorMode == 2) server.sendContent(F(" selected")); server.sendContent(F(">Blue</option>"));
+  server.sendContent(F("<option value=\"white\"")); if (displayColorMode == 3) server.sendContent(F(" selected")); server.sendContent(F(">White</option>"));
+  server.sendContent(F("<option value=\"yellow\"")); if (displayColorMode == 4) server.sendContent(F(" selected")); server.sendContent(F(">Yellow</option>"));
+  server.sendContent(F("<option value=\"cyan\"")); if (displayColorMode == 5) server.sendContent(F(" selected")); server.sendContent(F(">Cyan</option>"));
+  server.sendContent(F("<option value=\"purple\"")); if (displayColorMode == 6) server.sendContent(F(" selected")); server.sendContent(F(">Purple</option>"));
+  
+  server.sendContent(F("</select>"));
+
+  server.sendContent(F("<br><input type=submit class=\"btn send\" value=\"Save Settings\"></form>"));
+  server.sendContent(F("")); 
+}
+
+void handle_args() {
+  bool coreConfigChanged = false;
+
+  if (server.hasArg("HMOD24")) {
+    if (!military) { military = true; coreConfigChanged = true; }
+  } else if (server.args() > 0) {
+    if (military) { military = false; coreConfigChanged = true; }
+  }
+  
+  if (server.hasArg("NMSTART")) {
+    int val = server.arg("NMSTART").toInt();
+    if (val != nightModeStart) { nightModeStart = val; coreConfigChanged = true; }
+  }
+  if (server.hasArg("NMEND")) {
+    int val = server.arg("NMEND").toInt();
+    if (val != nightModeEnd) { nightModeEnd = val; coreConfigChanged = true; }
+  }
+  if (server.hasArg("FADE")) {
+    int val = server.arg("FADE").toInt();
+    if (val != morphFade) { morphFade = val; coreConfigChanged = true; }
+  }
+  
+  if (server.hasArg("TZ") || server.hasArg("tz")) {
+    String tzArg = server.hasArg("TZ") ? server.arg("TZ") : server.arg("tz");
+    if (tzArg != String(timezone)) {
+      strncpy(timezone, tzArg.c_str(), sizeof(timezone) - 1);
+      timezone[sizeof(timezone) - 1] = '\0';
+      coreConfigChanged = true;
+    }
+  }
+
+  if (server.hasArg("COLOR") || server.hasArg("color")) {
+    String cArg = server.hasArg("COLOR") ? server.arg("COLOR") : server.arg("color");
+    cArg.toLowerCase();
+    int oldColor = displayColorMode;
+    
+    if (cArg == "red" || cArg == "0") displayColorMode = 0;
+    else if (cArg == "green" || cArg == "1") displayColorMode = 1;
+    else if (cArg == "blue" || cArg == "2") displayColorMode = 2;
+    else if (cArg == "white" || cArg == "3") displayColorMode = 3;
+    else if (cArg == "yellow" || cArg == "4") displayColorMode = 4;
+    else if (cArg == "cyan" || cArg == "5") displayColorMode = 5;
+    else if (cArg == "purple" || cArg == "6") displayColorMode = 6;
+    
+    if (displayColorMode != oldColor) coreConfigChanged = true;
+  }
+
+  // If any values changed, save the configurations to storage cleanly
+  if (coreConfigChanged) {
+    saveConfig();
+    ntpClient.GetCurrentTime(true); // Forces timezone offset recalculations instantly
+  }
+  
+  updateDisplayColors();
+  page_out();
+}
+
+// =======================================================================================
+// System Initialization
+// =======================================================================================
+void setup() {
   Serial.begin(115200);
+  
   display.begin(16);
-
-#ifdef ESP8266
-  //display_ticker.attach(0.002, display_updater);
-  // First parameter is how often the display should be refreshed.
-  // Originally 0.002 caused unreliable WiFi on some NodeMCU.
-  // Hari changed this to 0.02 so it refresh less frequently.
-  // This caused display to be dimmer, so I increased how long the display should be latched from 70 to 500
-  display_ticker.attach(refreshRate, display_updater);
-#endif
-
-  //#ifdef ESP32
-  //  timer = timerBegin(0, 80, true);
-  //  timerAttachInterrupt(timer, &display_updater, true);
-  //  timerAlarmWrite(timer, 2000, true);
-  //  timerAlarmEnable(timer);
-  //#endif
-
-  // read stored parameters
-  EEPROM.begin(EEPROM_SIZE);
-  eptr = (unsigned char*) mclockp;
-  for (int i = 0; i < sizeof(mclock_struct); i++)
-    *(eptr++) = EEPROM.read(i);
-
-  // EEPROM-parameters invalid, use default-values and store them
-  if (mclockp->valid != 0xA5)
-  {
-    mclockp->h24 = 1;
-    mclockp->fade = 30;
-    mclockp->r = 0;
-    mclockp->g = 100;
-    mclockp->b = 0;
-    strcpy((char*)&mclockp->timezone, "ip");
-    mclockp->brightness = 100;
-    mclockp->nm_start = 0;
-    mclockp->nm_end = 0;
-#ifdef ESP32
-    mclockp->nm_brightness = 50;
-#else
-    mclockp->nm_brightness = 0;
-#endif
-    mclockp->valid = 0xA5;
-
-    eptr = (unsigned char*) mclockp;
-    for (int i = 0; i < sizeof(mclock_struct); i++)
-      EEPROM.write(i, *(eptr++));
-    EEPROM.commit();
-  }
-
-  brightness = mclockp->brightness;
-  strcpy(timezone, (char*)&mclockp->timezone);
-  military = mclockp->h24;
-
-  wtaClient.Setup(&display);
-  display.fillScreen(display.color565(0, 0, 0));
-
-  update_color();
-
-  // parsing function for the commands of the web-server
-  server.on("/", []()
-  {
-    int i;
-    unsigned int j;
-    long pval;
-
-    if (server.args())
-    {
-      for (i = 0; i < server.args(); i++)
-      {
-        if (server.argName(i) == "SEND")
-        {
-          *outstr = 0;
-          mclockp->h24 = 0;
-          military = 0;
-#ifndef ESP32
-          mclockp->r = 0;
-          mclockp->g = 0;
-          mclockp->b = 0;
-#endif
-        }
-      }
-      for (i = 0; i < server.args(); i++)
-      {
-        errno = 0;
-        if (server.argName(i) == "SAVE")
-        {
-          unsigned char *eptr = (unsigned char*)mclockp;
-
-          for (j = 0; j < sizeof(mclock_struct); j++)
-            EEPROM.write(j, *(eptr++));
-          EEPROM.commit();
-          if (!server.arg(i).length())
-            sprintf(outstr + strlen(outstr), "OK");
-        }
-        else if (server.argName(i) == "HMOD24")
-        {
-          if (server.arg(i) == "on")
-            mclockp->h24 = 1;
-          else if (server.arg(i) == "off")
-            mclockp->h24 = 0;
-          else
-            sprintf(outstr + strlen(outstr), "HMOD24=%s\r\n", (mclockp->h24) ? "on" : "off");
-          prevEpoch = 0;
-          if (military != mclockp->h24)
-          {
-            military = mclockp->h24;
-            wtaClient.GetCurrentTime(true);
-          }
-        }
-        else if (server.argName(i) == "TIMEZONE")
-        {
-          if (server.arg(i).length() && !errno)
-          {
-            strcpy((char*)&mclockp->timezone, server.arg(i).c_str());
-            strcpy((char*)&timezone, (char*)&mclockp->timezone);
-            wtaClient.GetCurrentTime(true);
-          }
-          else
-            sprintf(outstr + strlen(outstr), "TIMEZONE=%s\r\n", mclockp->timezone);
-        }
-        else if (server.argName(i) == "FADE")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->fade = pval;
-            if (mclockp->fade > 120)
-              mclockp->fade = 120;
-            if (mclockp->fade < 1)
-              mclockp->fade = 1;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "FADE=%d\r\n", mclockp->fade);
-        }
-#ifdef ESP32
-        else if (server.argName(i) == "BRIGHT")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->brightness = pval;
-            if (mclockp->brightness > 100)
-              mclockp->brightness = 100;
-            prevEpoch = 0;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "BRIGHT=%d\r\n", mclockp->brightness);
-        }
-        else if (server.argName(i) == "NMBRIGHT")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->nnm_brightness = pval;
-            if (mclockp->nm_brightness > 100)
-              mclockp->nm_brightness = 100;
-            prevEpoch = 0;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "NMBRIGHT=%d\r\n", mclockp->nm_brightness);
-        }
-        else if (server.argName(i) == "RED")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->r = pval;
-            if (mclockp->r > 100)
-              mclockp->r = 100;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "RED=%d\r\n", mclockp->r);
-        }
-        else if (server.argName(i) == "GREEN")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->g = pval;
-            if (mclockp->g > 100)
-              mclockp->g = 100;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "GREEN=%d\r\n", mclockp->g);
-        }
-        else if (server.argName(i) == "BLUE")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->b = pval;
-            if (mclockp->b > 100)
-              mclockp->b = 100;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "BLUE=%d\r\n", mclockp->b);
-        }
-#else
-        else if (server.argName(i) == "RED")
-        {
-          if (server.arg(i) == "on")
-            mclockp->r = 100;
-          else if (server.arg(i) == "off")
-            mclockp->r = 0;
-          else
-            sprintf(outstr + strlen(outstr), "RED=%s\r\n", (mclockp->r) ? "on" : "off");
-        }
-        else if (server.argName(i) == "GREEN")
-        {
-          if (server.arg(i) == "on")
-            mclockp->g = 100;
-          else if (server.arg(i) == "off")
-            mclockp->g = 0;
-          else
-            sprintf(outstr + strlen(outstr), "GREEN=%s\r\n", (mclockp->g) ? "on" : "off");
-        }
-        else if (server.argName(i) == "BLUE")
-        {
-          if (server.arg(i) == "on")
-            mclockp->b = 100;
-          else if (server.arg(i) == "off")
-            mclockp->b = 0;
-          else
-            sprintf(outstr + strlen(outstr), "BLUE=%s\r\n", (mclockp->b) ? "on" : "off");
-        }
-#endif
-        else if (server.argName(i) == "NMSTART")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->nm_start = abs(pval);
-            if (mclockp->nm_start > 23)
-              mclockp->nm_start = 0;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "NMSTART=%d\r\n", mclockp->nm_start);
-        }
-        else if (server.argName(i) == "NMEND")
-        {
-          pval = strtol(server.arg(i).c_str(), NULL, 10);
-          if (server.arg(i).length() && !errno)
-          {
-            mclockp->nm_end = abs(pval);
-            if (mclockp->nm_end > 23)
-              mclockp->nm_end = 0;
-          }
-          else
-            sprintf(outstr + strlen(outstr), "NMEND=%d\r\n", mclockp->nm_end);
-        }
-      }
-      *tstr2 = 0;
-    }
-    page_out();
-    update_color();
-  });
-  // start web-server
+  display_ticker.attach(0.002, display_updater);
+  
+  // This executes loadConfig() internally, reading saved parameters out of SPIFFS Flash
+  ntpClient.Setup(&display);
+  
+  uint16_t activeColor = getDisplayColor(displayColorMode);
+  Digits[0] = new Digit(&display, 0, 63 - 1 - 9*1, 8, activeColor); // Seconds Units
+  Digits[1] = new Digit(&display, 0, 63 - 1 - 9*2, 8, activeColor); // Seconds Tens
+  Digits[2] = new Digit(&display, 0, 63 - 4 - 9*3, 8, activeColor); // Minutes Units
+  Digits[3] = new Digit(&display, 0, 63 - 4 - 9*4, 8, activeColor); // Minutes Tens
+  Digits[4] = new Digit(&display, 0, 63 - 7 - 9*5, 8, activeColor); // Hours Units
+  Digits[5] = new Digit(&display, 0, 63 - 7 - 9*6, 8, activeColor); // Hours Tens
+  
+  // Purge lingering configuration text artifacts fully from both hardware buffers
+  display.clearDisplay(); display.showBuffer();
+  display.clearDisplay(); display.showBuffer();
+  
+  server.on("/", handle_args);
   server.begin();
-  Serial.println("Web server started!");
 }
 
-void loop()
-{
-  int tbright = brightness;
-  unsigned long epoch = wtaClient.GetCurrentTime(false);
-  //Serial.print("GetCurrentTime returned epoch = ");
-  //Serial.println(epoch);
-  if (epoch != 0)
-    wtaClient.PrintTime();
+// =======================================================================================
+// Core Asynchronous Processing Loop
+// =======================================================================================
+void loop() {
+  server.handleClient();
+  
+  unsigned long epoch = ntpClient.GetCurrentTime(false);
+  if (epoch != prevEpoch && epoch != 0) {
+    int hh = ntpClient.GetHours();
+    int mm = ntpClient.GetMinutes();
+    int ss = ntpClient.GetSeconds();
+    
+    // First hardware synchronization point
+    if (prevEpoch == 0) {
+      uint16_t colonColor = getDisplayColor(displayColorMode);
 
-  server.handleClient();            // handle HTTP-requests
-
-  if (epoch != prevEpoch)
-  {
-    int hh = wtaClient.GetHours();
-    int mm = wtaClient.GetMinutes();
-    int ss = wtaClient.GetSeconds();
-
-    if (mclockp->nm_start || mclockp->nm_end)
-    {
-      if (mclockp->nm_start > mclockp->nm_end)
-      {
-        tbright = ((hh >= mclockp->nm_start) || (hh < mclockp->nm_end)) ? mclockp->nm_brightness : mclockp->brightness;
-      }
-      else
-      {
-        tbright = ((hh >= mclockp->nm_start) && (hh < mclockp->nm_end)) ? mclockp->nm_brightness : mclockp->brightness;
-      }
+      Digits[0]->Draw(ss % 10); Digits[1]->Draw(ss / 10);
+      Digits[2]->Draw(mm % 10); Digits[3]->Draw(mm / 10);
+      Digits[4]->Draw(hh % 10); Digits[5]->Draw(hh / 10);
+      Digits[1]->DrawColon(colonColor); Digits[3]->DrawColon(colonColor);
+      display.showBuffer();
+      
+      Digits[0]->Draw(ss % 10); Digits[1]->Draw(ss / 10);
+      Digits[2]->Draw(mm % 10); Digits[3]->Draw(mm / 10);
+      Digits[4]->Draw(hh % 10); Digits[5]->Draw(hh / 10);
+      Digits[1]->DrawColon(colonColor); Digits[3]->DrawColon(colonColor);
+      display.showBuffer();
+      
+      prevss = ss; prevmm = mm; prevhh = hh;
+    } else {
+      if (ss != prevss) { Digits[0]->SetValue(ss % 10); Digits[1]->SetValue(ss / 10); prevss = ss; }
+      if (mm != prevmm) { Digits[2]->SetValue(mm % 10); Digits[3]->SetValue(mm / 10); prevmm = mm; }
+      if (hh != prevhh) { Digits[4]->SetValue(hh % 10); Digits[5]->SetValue(hh / 10); prevhh = hh; }
     }
-    else
-      tbright = mclockp->brightness;
-
-    if (tbright != brightness)
-    {
-      brightness = tbright;
-      update_color();
-    }
-
-    if (prevEpoch == 0)
-    { // If we didn't have a previous time. Just draw it without morphing.
-      Digits[DIG_S0]->Draw(ss % 10);
-      Digits[DIG_S1]->Draw(ss / 10);
-      Digits[DIG_M0]->Draw(mm % 10);
-      Digits[DIG_M1]->Draw(mm / 10);
-      Digits[DIG_H0]->Draw(hh % 10);
-      Digits[DIG_H1]->Draw(hh / 10);
-    }
-    else
-    {
-      // epoch changes every miliseconds, we only want to draw when digits actually change.
-      if (ss != prevss)
-      {
-        int s0 = ss % 10;
-        int s1 = ss / 10;
-        Digits[DIG_S0]->SetValue(s0);
-        Digits[DIG_S1]->SetValue(s1);
-        prevss = ss;
-      }
-
-      if (mm != prevmm)
-      {
-        int m0 = mm % 10;
-        int m1 = mm / 10;
-        Digits[DIG_M0]->SetValue(m0);
-        Digits[DIG_M1]->SetValue(m1);
-        prevmm = mm;
-      }
-
-      if (hh != prevhh)
-      {
-        int h0 = hh % 10;
-        int h1 = hh / 10;
-        Digits[DIG_H0]->SetValue(h0);
-        Digits[DIG_H1]->SetValue(h1);
-        prevhh = hh;
-      }
-    }
+    
     prevEpoch = epoch;
   }
-
-  for (int i = 0; i < NUM_DIGITS; i++)
-    Digits[i]->Morph();
-  delay(mclockp->fade);
+  
+  // Dynamic refresh animation throttling
+  static unsigned long lastMorphTime = 0;
+  if (millis() - lastMorphTime >= (unsigned long)morphFade) {
+    lastMorphTime = millis();
+    
+    for (int i = 0; i < NUM_DIGITS; i++) {
+      Digits[i]->Morph();
+    }
+    
+    uint16_t colonColor = getDisplayColor(displayColorMode);
+    Digits[1]->DrawColon(colonColor);
+    Digits[3]->DrawColon(colonColor);
+    
+    display.showBuffer();
+  }
 }

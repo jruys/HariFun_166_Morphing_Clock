@@ -2,6 +2,8 @@
 
 ----------
 
+**Update: Don't use this code** - the vibe coding AI broke multiple bits, amongst others the night mode. Working on a fix.
+
 Forked from SnowHeads version which stopped working in 2026 because HTTP time request was sunset, back to NTP
 This fork only works for ESP8266
 Gemini helped with the fixes, it's not clean at all but at least it works again
